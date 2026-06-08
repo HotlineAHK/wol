@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""
+wol — Wake-on-LAN tool
+Cross-platform (Linux / Windows)
+
+Usage:
+    ./wol scan       Scan network and save MAC list
+    ./wol wake       Wake all devices from saved list
+"""
+
+import argparse
+import os
+import platform
+import re
+import socket
+import subprocess
+import sys
+import time
+
+FILE = "wol_targets.txt"
+PORT = 9
+
+
+# ── Scan ────────────────────────────────────────────────────────────────────
+
+
+def scan_network() -> None:
+    print("Сканирование сети и сбор MAC-адресов...")
+
+    if platform.system() == "Linux":
+        _nmap_scan()
+
+    macs = _parse_arp()
+
+    if not macs:
+        print("Не удалось найти устройства. Проверьте подключение к сети.")
+        return
+
+    with open(FILE, "w") as f:
+        for mac in sorted(macs):
+            f.write(mac + "\n")
+
+    print(f"Найдено устройств: {len(macs)}. Список сохранен в {FILE}")
+
+
+def _get_subnet() -> str:
+    try:
+        r = subprocess.run(
+            ["ip", "route"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in r.stdout.splitlines():
+            if "src" in line:
+                parts = line.split()
+                idx = parts.index("src")
+                if idx > 0:
+                    return parts[idx - 1]
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return "192.168.1.0/24"
+
+
+def _nmap_scan() -> None:
+    subnet = _get_subnet()
+    try:
+        subprocess.run(
+            ["nmap", "-sn", subnet],
+            capture_output=True, timeout=60,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+
+def _parse_arp() -> set[str]:
+    macs: set[str] = set()
+    mac_re = re.compile(r"([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}")
+
+    try:
+        r = subprocess.run(
+            ["arp", "-a"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for m in mac_re.finditer(r.stdout):
+            mac = m.group(0).replace("-", ":").lower()
+            if mac != "ff:ff:ff:ff:ff:ff":
+                macs.add(mac)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    return macs
+
+
+# ── Wake ────────────────────────────────────────────────────────────────────
+
+
+def wake_devices() -> None:
+    if not os.path.exists(FILE):
+        print(
+            f"Ошибка: файл {FILE} не найден. "
+            f"Сначала выполните: {sys.argv[0]} scan"
+        )
+        sys.exit(1)
+
+    print("Массовое пробуждение устройств...")
+
+    with open(FILE) as f:
+        macs = [line.strip() for line in f if line.strip() and not line.startswith("#")]
+
+    for mac in macs:
+        _send_magic_packet(mac)
+        time.sleep(0.1)
+
+    print("Пакеты отправлены.")
+
+
+def _send_magic_packet(mac_str: str) -> None:
+    mac = mac_str.replace(":", "").replace("-", "")
+    mac_bytes = bytes.fromhex(mac)
+
+    magic = b"\xff" * 6 + mac_bytes * 16
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.sendto(magic, ("255.255.255.255", PORT))
+
+
+# ── CLI ─────────────────────────────────────────────────────────────────────
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Wake-on-LAN tool")
+    parser.add_argument(
+        "action",
+        choices=["scan", "wake"],
+        help="scan — собрать MAC-адреса; wake — разбудить устройства",
+    )
+    args = parser.parse_args()
+
+    if args.action == "scan":
+        scan_network()
+    else:
+        wake_devices()
+
+
+if __name__ == "__main__":
+    main()
